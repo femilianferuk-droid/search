@@ -1,0 +1,2402 @@
+import asyncio
+import logging
+import os
+import json
+import random
+import string
+import uuid
+import re
+from typing import Optional, List, Dict, Tuple, Any
+from datetime import datetime, timedelta
+
+from dotenv import load_dotenv
+import aiohttp
+import asyncpg
+
+from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+from telethon import TelegramClient
+from telethon.errors import (
+    UsernameNotOccupiedError,
+    UsernameOccupiedError,
+    FloodWaitError,
+    SessionPasswordNeededError
+)
+from telethon.tl.functions.account import CheckUsernameRequest, UpdateUsernameRequest
+from telethon.tl.functions.channels import CreateChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+from telethon.sessions import StringSession
+
+# --- Загрузка переменных окружения ---
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+CRYPTO_BOT_TOKEN = os.getenv("CRYPTO_BOT_TOKEN")
+
+ADMIN_ID = 7973988177
+API_ID = 32480523
+API_HASH = "147839735c9fa4e83451209e9b55cfc5"
+SUPPORT_USERNAME = "VestSupport"
+
+if not BOT_TOKEN:
+    raise ValueError("Не указан BOT_TOKEN")
+if not DATABASE_URL:
+    raise ValueError("Не указан DATABASE_URL")
+
+# --- Настройки ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+storage = MemoryStorage()
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=storage)
+router = Router()
+dp.include_router(router)
+
+# --- Глобальные переменные ---
+http_session: Optional[aiohttp.ClientSession] = None
+db_pool: Optional[asyncpg.Pool] = None
+telethon_clients: List[TelegramClient] = []
+current_client_index = 0
+nft_cache: Dict[str, List[Dict]] = {}
+
+# --- Премиум эмодзи (ID) ---
+EMOJI = {
+    "search": "5870982283724328568",
+    "market": "5884479287171485878",
+    "profile": "5870994129244131212",
+    "check": "5870633910337015697",
+    "cross": "5870657884844462243",
+    "pencil": "5870676941614354370",
+    "info": "6028435952299413210",
+    "bot_icon": "6030400221232501136",
+    "eye": "6037397706505195857",
+    "money": "5904462880941545555",
+    "gift": "6032644646587338669",
+    "back": "5893057118545646106",
+    "clock": "5983150113483134607",
+    "write": "5870753782874246579",
+    "link": "5769289093221454192",
+    "graph": "5870921681735781843",
+    "loading": "5345906554510012647",
+    "admin": "5870982283724328568",
+    "add": "5870633910337015697",
+    "stats": "5870921681735781843",
+    "broadcast": "6039422865189638057",
+    "auto": "6030400221232501136",
+    "wallet": "5769126056262898415",
+    "buy": "5904462880941545555",
+    "sell": "5890848474563352982",
+    "support": "6039450962865688331",
+    "owner": "5891207662678317861",
+    "pro": "5870633910337015697",
+    "group": "5870772616305839506",
+    "channel": "5873147866364514353",
+    "bot_create": "6030400221232501136",
+    "key": "6037249452824072506",
+    "phone": "6039450962865688331",
+    "invite": "5769289093221454192",
+    "transfer": "5890848474563352982",
+    "people": "5870772616305839506",
+    "trash": "5870875489362513438",
+    "nft": "5870695322143094421",
+}
+
+def em(name: str) -> str:
+    """Возвращает премиум эмодзи в формате tg-emoji"""
+    emoji_id = EMOJI.get(name, EMOJI["check"])
+    return f'<tg-emoji emoji-id="{emoji_id}">👍</tg-emoji>'
+
+# --- Состояния FSM ---
+class SearchStates(StatesGroup):
+    waiting_for_keyword = State()
+    waiting_for_length = State()
+
+class BotSearchStates(StatesGroup):
+    waiting_for_keyword = State()
+    waiting_for_length = State()
+    waiting_for_suffix = State()
+
+class MarketSellStates(StatesGroup):
+    waiting_for_price = State()
+    waiting_for_invite_link = State()
+    waiting_for_transfer = State()
+
+class AdminStates(StatesGroup):
+    waiting_for_phone = State()
+    waiting_for_code = State()
+    waiting_for_2fa = State()
+    waiting_for_broadcast = State()
+    waiting_for_balance_user = State()
+    waiting_for_balance_amount = State()
+    waiting_for_delete_user = State()
+
+class AutoReserveStates(StatesGroup):
+    waiting_for_keyword = State()
+    waiting_for_count = State()
+
+class CreateStates(StatesGroup):
+    waiting_for_bot_name = State()
+    waiting_for_bot_username = State()
+
+class BalanceStates(StatesGroup):
+    waiting_for_amount = State()
+    waiting_for_payment = State()
+
+class NFTMonitorStates(StatesGroup):
+    waiting_for_collection = State()
+
+# --- База данных ---
+async def init_db():
+    global db_pool
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL)
+    except Exception as e:
+        logger.error(f"Ошибка подключения к БД: {e}")
+        raise
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                balance DECIMAL(10,2) DEFAULT 0,
+                searches_count INTEGER DEFAULT 0,
+                searches_today INTEGER DEFAULT 0,
+                last_search_date DATE DEFAULT CURRENT_DATE,
+                found_count INTEGER DEFAULT 0,
+                referrals INTEGER DEFAULT 0,
+                is_pro BOOLEAN DEFAULT FALSE,
+                pro_expires_at TIMESTAMP,
+                bots_created INTEGER DEFAULT 0,
+                last_searches JSONB DEFAULT '[]',
+                registered_date TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS market_listings (
+                id SERIAL PRIMARY KEY,
+                seller_id BIGINT,
+                seller_username TEXT,
+                channel_username TEXT UNIQUE,
+                price DECIMAL(10,2),
+                status TEXT DEFAULT 'pending',
+                bot_joined BOOLEAN DEFAULT FALSE,
+                owner_verified BOOLEAN DEFAULT FALSE,
+                buyer_id BIGINT,
+                bot_account_username TEXT,
+                created_date TIMESTAMP DEFAULT NOW(),
+                sold_date TIMESTAMP
+            )
+        """)
+        
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS telethon_accounts (
+                id SERIAL PRIMARY KEY,
+                phone TEXT UNIQUE,
+                session_string TEXT,
+                is_active BOOLEAN DEFAULT TRUE,
+                added_by BIGINT,
+                added_date TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS crypto_payments (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                invoice_id TEXT UNIQUE,
+                amount DECIMAL(10,2),
+                type TEXT DEFAULT 'deposit',
+                status TEXT DEFAULT 'pending',
+                created_date TIMESTAMP DEFAULT NOW(),
+                paid_date TIMESTAMP
+            )
+        """)
+        
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS created_bots (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                bot_username TEXT,
+                bot_token TEXT,
+                bot_name TEXT,
+                created_date TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS nft_monitoring (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                collection_address TEXT,
+                collection_name TEXT,
+                last_nft_id TEXT,
+                last_checked TIMESTAMP DEFAULT NOW(),
+                is_active BOOLEAN DEFAULT TRUE,
+                created_date TIMESTAMP DEFAULT NOW(),
+                UNIQUE(user_id, collection_address)
+            )
+        """)
+        
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS nft_monitoring_subscriptions (
+                user_id BIGINT PRIMARY KEY,
+                expires_at TIMESTAMP,
+                is_active BOOLEAN DEFAULT FALSE
+            )
+        """)
+    
+    logger.info("База данных инициализирована")
+
+async def get_user(user_id: int) -> Optional[asyncpg.Record]:
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+
+async def create_or_update_user(user_id: int, username: str = None):
+    async with db_pool.acquire() as conn:
+        user = await get_user(user_id)
+        if not user:
+            await conn.execute(
+                "INSERT INTO users (user_id, username) VALUES ($1, $2)",
+                user_id, username
+            )
+        elif username and user['username'] != username:
+            await conn.execute(
+                "UPDATE users SET username = $1 WHERE user_id = $2",
+                username, user_id
+            )
+
+async def get_user_balance(user_id: int) -> float:
+    user = await get_user(user_id)
+    return float(user['balance']) if user else 0
+
+async def add_balance(user_id: int, amount: float):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET balance = balance + $1 WHERE user_id = $2",
+            amount, user_id
+        )
+
+async def subtract_balance(user_id: int, amount: float) -> bool:
+    async with db_pool.acquire() as conn:
+        user = await get_user(user_id)
+        if user and float(user['balance']) >= amount:
+            await conn.execute(
+                "UPDATE users SET balance = balance - $1 WHERE user_id = $2",
+                amount, user_id
+            )
+            return True
+        return False
+
+async def get_user_limits(user_id: int) -> Dict[str, int]:
+    user = await get_user(user_id)
+    is_pro = user['is_pro'] if user else False
+    
+    if user and user['pro_expires_at'] and user['pro_expires_at'] < datetime.now():
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE users SET is_pro = FALSE WHERE user_id = $1", user_id)
+        is_pro = False
+    
+    if is_pro:
+        return {"bots": 10, "searches_per_day": 100}
+    return {"bots": 3, "searches_per_day": 30}
+
+async def can_create(user_id: int, create_type: str) -> bool:
+    user = await get_user(user_id)
+    if not user:
+        return False
+    
+    limits = await get_user_limits(user_id)
+    field = f"{create_type}s_created"
+    current = user[field] if field in user and user[field] is not None else 0
+    
+    return current < limits[create_type]
+
+async def increment_created(user_id: int, create_type: str):
+    async with db_pool.acquire() as conn:
+        field = f"{create_type}s_created"
+        await conn.execute(
+            f"UPDATE users SET {field} = COALESCE({field}, 0) + 1 WHERE user_id = $1",
+            user_id
+        )
+
+async def activate_pro(user_id: int):
+    async with db_pool.acquire() as conn:
+        expires = datetime.now() + timedelta(days=30)
+        await conn.execute(
+            "UPDATE users SET is_pro = TRUE, pro_expires_at = $1 WHERE user_id = $2",
+            expires, user_id
+        )
+
+async def get_all_users() -> List[int]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM users")
+        return [row['user_id'] for row in rows]
+
+async def can_search_today(user_id: int) -> Tuple[bool, int, int]:
+    """Проверяет, может ли пользователь выполнить поиск сегодня"""
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT searches_today, last_search_date, is_pro FROM users WHERE user_id = $1",
+            user_id
+        )
+        
+        if not user:
+            return False, 0, 0
+        
+        today = datetime.now().date()
+        last_date = user['last_search_date']
+        
+        if last_date != today:
+            await conn.execute(
+                "UPDATE users SET searches_today = 0, last_search_date = $1 WHERE user_id = $2",
+                today, user_id
+            )
+            searches_today = 0
+        else:
+            searches_today = user['searches_today']
+        
+        limits = await get_user_limits(user_id)
+        max_searches = limits['searches_per_day']
+        
+        return searches_today < max_searches, searches_today, max_searches
+
+async def increment_search(user_id: int):
+    async with db_pool.acquire() as conn:
+        today = datetime.now().date()
+        await conn.execute(
+            """UPDATE users 
+               SET searches_count = searches_count + 1,
+                   searches_today = searches_today + 1,
+                   last_search_date = $1
+               WHERE user_id = $2""",
+            today, user_id
+        )
+
+async def add_found_nick(user_id: int, count: int = 1):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET found_count = found_count + $1 WHERE user_id = $2",
+            count, user_id
+        )
+
+async def delete_user(user_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM users WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM market_listings WHERE seller_id = $1", user_id)
+        await conn.execute("DELETE FROM created_bots WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM nft_monitoring WHERE user_id = $1", user_id)
+
+async def has_nft_monitoring(user_id: int) -> bool:
+    async with db_pool.acquire() as conn:
+        sub = await conn.fetchrow(
+            "SELECT is_active, expires_at FROM nft_monitoring_subscriptions WHERE user_id = $1",
+            user_id
+        )
+        if not sub:
+            return False
+        if sub['expires_at'] and sub['expires_at'] < datetime.now():
+            await conn.execute(
+                "UPDATE nft_monitoring_subscriptions SET is_active = FALSE WHERE user_id = $1",
+                user_id
+            )
+            return False
+        return sub['is_active']
+
+async def activate_nft_monitoring(user_id: int, days: int = 30):
+    async with db_pool.acquire() as conn:
+        expires = datetime.now() + timedelta(days=days)
+        await conn.execute(
+            """INSERT INTO nft_monitoring_subscriptions (user_id, expires_at, is_active) 
+               VALUES ($1, $2, TRUE) 
+               ON CONFLICT (user_id) DO UPDATE 
+               SET expires_at = $2, is_active = TRUE""",
+            user_id, expires
+        )
+
+async def add_nft_monitoring(user_id: int, collection_address: str, collection_name: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO nft_monitoring (user_id, collection_address, collection_name) 
+               VALUES ($1, $2, $3)
+               ON CONFLICT (user_id, collection_address) DO UPDATE 
+               SET is_active = TRUE, collection_name = $3""",
+            user_id, collection_address, collection_name
+        )
+
+async def remove_nft_monitoring(user_id: int, collection_address: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE nft_monitoring SET is_active = FALSE WHERE user_id = $1 AND collection_address = $2",
+            user_id, collection_address
+        )
+
+async def get_user_nft_monitoring(user_id: int) -> List[asyncpg.Record]:
+    async with db_pool.acquire() as conn:
+        return await conn.fetch(
+            "SELECT * FROM nft_monitoring WHERE user_id = $1 AND is_active = TRUE",
+            user_id
+        )
+
+async def get_all_nft_monitoring() -> List[asyncpg.Record]:
+    async with db_pool.acquire() as conn:
+        return await conn.fetch(
+            """SELECT nm.* FROM nft_monitoring nm 
+               JOIN nft_monitoring_subscriptions nms ON nm.user_id = nms.user_id
+               WHERE nm.is_active = TRUE AND nms.is_active = TRUE AND nms.expires_at > NOW()"""
+        )
+
+async def update_nft_last_id(monitoring_id: int, last_nft_id: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE nft_monitoring SET last_nft_id = $1, last_checked = NOW() WHERE id = $2",
+            last_nft_id, monitoring_id
+        )
+
+# --- Telethon ---
+async def load_telethon_accounts():
+    global telethon_clients
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT phone, session_string FROM telethon_accounts WHERE is_active = TRUE"
+        )
+    
+    for row in rows:
+        if row['session_string']:
+            client = TelegramClient(StringSession(row['session_string']), API_ID, API_HASH)
+            try:
+                await client.connect()
+                if await client.is_user_authorized():
+                    telethon_clients.append(client)
+                    logger.info(f"Аккаунт {row['phone']} загружен")
+            except Exception as e:
+                logger.error(f"Ошибка загрузки {row['phone']}: {e}")
+
+async def save_telethon_account(phone: str, session_string: str, added_by: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO telethon_accounts (phone, session_string, added_by) 
+               VALUES ($1, $2, $3) 
+               ON CONFLICT (phone) DO UPDATE SET session_string = $2, is_active = TRUE""",
+            phone, session_string, added_by
+        )
+
+def get_next_client() -> Optional[TelegramClient]:
+    global current_client_index
+    if not telethon_clients:
+        return None
+    client = telethon_clients[current_client_index]
+    current_client_index = (current_client_index + 1) % len(telethon_clients)
+    return client
+
+async def get_bot_username(client: TelegramClient) -> str:
+    me = await client.get_me()
+    return me.username or f"id{me.id}"
+
+async def check_username_real(username: str) -> bool:
+    client = get_next_client()
+    if not client:
+        return False
+    
+    try:
+        result = await client(CheckUsernameRequest(username))
+        return result
+    except UsernameOccupiedError:
+        return False
+    except FloodWaitError as e:
+        await asyncio.sleep(min(e.seconds, 5))
+        return False
+    except Exception:
+        return False
+
+async def check_many_usernames(usernames: List[str], max_workers: int = 5) -> List[str]:
+    found = []
+    for i in range(0, len(usernames), max_workers):
+        batch = usernames[i:i + max_workers]
+        tasks = [check_username_real(u) for u in batch]
+        results = await asyncio.gather(*tasks)
+        
+        for username, is_free in zip(batch, results):
+            if is_free:
+                found.append(username)
+        
+        await asyncio.sleep(0.5)
+    
+    return found
+
+# --- Генерация юзернеймов ---
+def generate_random_usernames(length: int, count: int = 50) -> List[str]:
+    variants = set()
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    
+    while len(variants) < count:
+        username = ''.join(random.choices(letters, k=length))
+        variants.add(username)
+    
+    return list(variants)
+
+def generate_bot_usernames(keyword: str, length: int, suffix_type: str, count: int = 50) -> List[str]:
+    variants = set()
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    digits = "0123456789"
+    
+    suffix = "bot" if suffix_type == "bot" else "_bot"
+    base_length = length - len(suffix)
+    
+    if base_length <= 0:
+        return []
+    
+    while len(variants) < count:
+        if keyword:
+            if len(keyword) <= base_length:
+                remaining = base_length - len(keyword)
+                if random.choice([True, False]):
+                    username = keyword + ''.join(random.choices(letters + digits, k=remaining))
+                else:
+                    username = ''.join(random.choices(letters + digits, k=remaining)) + keyword
+            else:
+                username = keyword[:base_length]
+        else:
+            username = ''.join(random.choices(letters, k=base_length))
+        
+        full_username = username + suffix
+        variants.add(full_username)
+    
+    return list(variants)
+
+def generate_with_keyword(keyword: str, length: int, count: int = 50) -> List[str]:
+    variants = set()
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    
+    if len(keyword) >= length:
+        return [keyword[:length]]
+    
+    remaining = length - len(keyword)
+    
+    while len(variants) < count:
+        if random.choice([True, False]):
+            suffix = ''.join(random.choices(letters, k=remaining))
+            variants.add(keyword + suffix)
+        else:
+            prefix = ''.join(random.choices(letters, k=remaining))
+            variants.add(prefix + keyword)
+    
+    return list(variants)
+
+# --- Crypto Bot API ---
+async def create_crypto_invoice(user_id: int, amount_rub: float, invoice_type: str = "deposit") -> Optional[Dict]:
+    if not CRYPTO_BOT_TOKEN:
+        return None
+    
+    url = "https://pay.crypt.bot/api/createInvoice"
+    headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
+    
+    amount_usdt = round(amount_rub / 90, 2)
+    invoice_id = str(uuid.uuid4())
+    
+    descriptions = {
+        "deposit": f"Пополнение баланса Vest Search на {amount_rub} RUB",
+        "pro": "Подписка Vest Search Pro на 30 дней",
+        "nft_monitoring": "Подписка на NFT мониторинг Vest Search на 30 дней"
+    }
+    
+    data = {
+        "asset": "USDT",
+        "amount": str(amount_usdt),
+        "description": descriptions.get(invoice_type, f"Платеж Vest Search"),
+        "payload": invoice_id,
+        "allow_comments": False,
+        "allow_anonymous": False,
+        "expires_in": 3600
+    }
+    
+    try:
+        async with http_session.post(url, headers=headers, json=data) as resp:
+            result = await resp.json()
+            
+            if result.get("ok"):
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "INSERT INTO crypto_payments (user_id, invoice_id, amount, type) VALUES ($1, $2, $3, $4)",
+                        user_id, invoice_id, amount_rub, invoice_type
+                    )
+                return {
+                    "invoice_id": invoice_id,
+                    "pay_url": result["result"]["pay_url"],
+                    "amount_usdt": amount_usdt
+                }
+            return None
+    except Exception as e:
+        logger.error(f"Crypto Bot exception: {e}")
+        return None
+
+# --- Вступление в канал по ссылке ---
+def extract_invite_hash(link: str) -> Optional[str]:
+    patterns = [
+        r't\.me/(?:joinchat/|\+)([a-zA-Z0-9_-]+)',
+        r'telegram\.me/(?:joinchat/|\+)([a-zA-Z0-9_-]+)',
+        r'https?://t\.me/(?:joinchat/|\+)([a-zA-Z0-9_-]+)'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, link)
+        if match:
+            return match.group(1)
+    return None
+
+async def join_channel_by_link(client: TelegramClient, invite_link: str) -> Tuple[bool, Optional[str], Optional[str]]:
+    invite_hash = extract_invite_hash(invite_link)
+    if not invite_hash:
+        return False, None, "Неверный формат ссылки"
+    
+    try:
+        await client(CheckChatInviteRequest(invite_hash))
+        updates = await client(ImportChatInviteRequest(invite_hash))
+        
+        if updates.chats:
+            channel = updates.chats[0]
+            channel_username = getattr(channel, 'username', None)
+            return True, channel_username, None
+        else:
+            return False, None, "Не удалось получить информацию о канале"
+            
+    except Exception as e:
+        return False, None, f"Ошибка: {str(e)[:100]}"
+
+# --- Создание бота через BotFather ---
+async def create_bot_via_botfather(client: TelegramClient, bot_name: str, bot_username: str) -> Optional[Tuple[str, str]]:
+    try:
+        botfather = await client.get_entity("@BotFather")
+        
+        await client.send_message(botfather, "/start")
+        await asyncio.sleep(4)
+        
+        await client.send_message(botfather, "/newbot")
+        await asyncio.sleep(4)
+        
+        await client.send_message(botfather, bot_name)
+        await asyncio.sleep(4)
+        
+        await client.send_message(botfather, bot_username)
+        await asyncio.sleep(4)
+        
+        messages = await client.get_messages(botfather, limit=1)
+        if messages and messages[0].message:
+            text = messages[0].message
+            token_match = re.search(r'(\d+:[A-Za-z0-9_-]+)', text)
+            if token_match:
+                token = token_match.group(1)
+                return bot_username, token
+        
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка создания бота: {e}")
+        return None
+
+async def save_bot_token(user_id: int, bot_username: str, bot_token: str, bot_name: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO created_bots (user_id, bot_username, bot_token, bot_name) VALUES ($1, $2, $3, $4)",
+            user_id, bot_username, bot_token, bot_name
+        )
+
+async def get_stats() -> Dict[str, Any]:
+    async with db_pool.acquire() as conn:
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+        total_balance = await conn.fetchval("SELECT SUM(balance) FROM users") or 0
+        total_searches = await conn.fetchval("SELECT SUM(searches_count) FROM users") or 0
+        active_listings = await conn.fetchval("SELECT COUNT(*) FROM market_listings WHERE status = 'active'") or 0
+        pro_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_pro = TRUE") or 0
+        total_bots = await conn.fetchval("SELECT COUNT(*) FROM created_bots") or 0
+        nft_subs = await conn.fetchval("SELECT COUNT(*) FROM nft_monitoring_subscriptions WHERE is_active = TRUE") or 0
+        
+        return {
+            "total_users": total_users,
+            "total_balance": float(total_balance),
+            "total_searches": total_searches,
+            "active_listings": active_listings,
+            "pro_users": pro_users,
+            "total_bots": total_bots,
+            "nft_subs": nft_subs,
+            "telethon_accounts": len(telethon_clients)
+        }
+
+# --- NFT Мониторинг (реальный API Getgems/Fragment) ---
+async def fetch_nft_collections() -> List[Dict]:
+    """Получает список популярных NFT коллекций через API Getgems"""
+    collections = [
+        {"name": "Notcoin NFT", "address": "EQDmkjCqcZGhZaiPZ8uDnwE4fTubKcZbX6H9Nn5RmH2L", "description": "Официальная коллекция Notcoin"},
+        {"name": "TON Diamonds", "address": "EQCmN-pdAtEo4NcGK5n_8K8gH8sM-Q0R5J6yL2vT0K1p", "description": "Алмазы на TON"},
+        {"name": "TON Punks", "address": "EQCA14z3A-V9gYhNkG3lL5qK7mB0wR1sT2uX4vY6cD8e", "description": "Панки на блокчейне TON"},
+    ]
+    
+    try:
+        async with http_session.get("https://api.getgems.io/graphql", 
+                                   json={"query": "{ collections(first: 10, orderBy: {path: \"volume\", direction: DESC}) { items { address name description } } }"}) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if "data" in data and "collections" in data["data"]:
+                    api_collections = data["data"]["collections"]["items"]
+                    for coll in api_collections:
+                        collections.append({
+                            "name": coll.get("name", "Unknown"),
+                            "address": coll.get("address", ""),
+                            "description": coll.get("description", "")
+                        })
+    except Exception as e:
+        logger.error(f"Ошибка получения коллекций: {e}")
+    
+    return collections
+
+async def fetch_nft_from_getgems(collection_address: str, limit: int = 10) -> List[Dict]:
+    """Получает NFT из коллекции через API Getgems"""
+    nfts = []
+    
+    try:
+        url = "https://api.getgems.io/graphql"
+        
+        query = """
+        query GetCollectionNFTs($address: String!, $limit: Int) {
+            nftCollectionByAddress(address: $address) {
+                name
+                nftItems(first: $limit, orderBy: {path: "index", direction: DESC}) {
+                    items {
+                        address
+                        index
+                        name
+                        owner {
+                            address
+                            name
+                        }
+                        sale {
+                            fullPrice
+                        }
+                    }
+                }
+            }
+        }
+        """
+        
+        variables = {
+            "address": collection_address,
+            "limit": limit
+        }
+        
+        async with http_session.post(url, json={"query": query, "variables": variables}) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                
+                if "data" in data and data["data"]["nftCollectionByAddress"]:
+                    collection = data["data"]["nftCollectionByAddress"]
+                    collection_name = collection.get("name", "Unknown")
+                    
+                    for item in collection.get("nftItems", {}).get("items", []):
+                        nft_address = item.get("address", "")
+                        nft_name = item.get("name", f"{collection_name} #{item.get('index', '')}")
+                        owner_info = item.get("owner", {})
+                        
+                        nfts.append({
+                            "id": nft_address,
+                            "name": nft_name,
+                            "address": nft_address,
+                            "collection": collection_name,
+                            "collection_address": collection_address,
+                            "owner": owner_info.get("name") or owner_info.get("address", "Unknown")[:10] + "...",
+                            "price": item.get("sale", {}).get("fullPrice"),
+                            "link": f"https://getgems.io/collection/{collection_address}/{nft_address}"
+                        })
+    except Exception as e:
+        logger.error(f"Ошибка Getgems API: {e}")
+    
+    return nfts
+
+async def check_nft_updates(collection_address: str, collection_name: str, last_nft_id: Optional[str] = None) -> Tuple[List[Dict], str]:
+    """Проверяет обновления NFT в коллекции"""
+    new_nfts = []
+    new_last_id = last_nft_id or ""
+    
+    nfts = await fetch_nft_from_getgems(collection_address)
+    
+    if nfts:
+        if last_nft_id:
+            for nft in nfts:
+                if nft["id"] == last_nft_id:
+                    break
+                new_nfts.append(nft)
+        else:
+            new_nfts = []
+        
+        if nfts:
+            new_last_id = nfts[0]["id"]
+    
+    return new_nfts, new_last_id
+
+async def notify_user_about_nft(user_id: int, nft_data: Dict):
+    """Отправляет уведомление пользователю о новом NFT"""
+    try:
+        text = (
+            f"{em('nft')} <b>Новый NFT в коллекции!</b>\n\n"
+            f"🎨 <b>Коллекция:</b> {nft_data.get('collection', 'Unknown')}\n"
+            f"🖼 <b>NFT:</b> {nft_data.get('name', 'Unknown')}\n"
+            f"👤 <b>Владелец:</b> {nft_data.get('owner', 'Unknown')}\n"
+        )
+        
+        if nft_data.get('price'):
+            price_ton = float(nft_data['price']) / 1_000_000_000
+            text += f"💰 <b>Цена:</b> {price_ton:.2f} TON\n"
+        
+        if nft_data.get('link'):
+            text += f"\n🔗 <b>Ссылка:</b> {nft_data['link']}"
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🔗 Открыть NFT",
+                url=nft_data.get('link', 'https://getgems.io')
+            )]
+        ])
+        
+        await bot.send_message(user_id, text, reply_markup=keyboard)
+    except Exception as e:
+        logger.error(f"Ошибка отправки уведомления {user_id}: {e}")
+
+async def nft_monitoring_task():
+    """Фоновая задача для мониторинга NFT"""
+    while True:
+        try:
+            monitorings = await get_all_nft_monitoring()
+            
+            for mon in monitorings:
+                try:
+                    user_id = mon['user_id']
+                    collection_address = mon['collection_address']
+                    collection_name = mon['collection_name']
+                    last_nft_id = mon.get('last_nft_id')
+                    
+                    new_nfts, new_last_id = await check_nft_updates(
+                        collection_address, 
+                        collection_name, 
+                        last_nft_id
+                    )
+                    
+                    for nft in new_nfts:
+                        await notify_user_about_nft(user_id, nft)
+                    
+                    if new_last_id and new_last_id != last_nft_id:
+                        await update_nft_last_id(mon['id'], new_last_id)
+                    
+                    await asyncio.sleep(1)
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка мониторинга для {user_id}: {e}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка в задаче мониторинга: {e}")
+        
+        await asyncio.sleep(60)  # Проверка каждую минуту
+
+# --- Клавиатуры ---
+def get_main_keyboard():
+    """Главное меню"""
+    builder = ReplyKeyboardBuilder()
+    builder.row(
+        KeyboardButton(text=f"{em('search')} Поиск"),
+        KeyboardButton(text=f"{em('bot_icon')} Поиск ботов")
+    )
+    builder.row(
+        KeyboardButton(text=f"{em('bot_create')} Создание бота"),
+        KeyboardButton(text=f"{em('nft')} NFT Мониторинг")
+    )
+    builder.row(
+        KeyboardButton(text=f"{em('market')} Маркет"),
+        KeyboardButton(text=f"{em('profile')} Профиль")
+    )
+    return builder.as_markup(resize_keyboard=True)
+
+def get_back_button():
+    """Кнопка назад"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="◁ Назад",
+            callback_data="back_to_main"
+        )]
+    ])
+
+def get_bot_search_type_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="5 символов",
+            callback_data="botsearch_len_5"
+        )],
+        [InlineKeyboardButton(
+            text="6 символов",
+            callback_data="botsearch_len_6"
+        )],
+        [InlineKeyboardButton(
+            text="С ключевым словом",
+            callback_data="botsearch_keyword"
+        )],
+        [InlineKeyboardButton(
+            text="◁ Назад",
+            callback_data="back_to_main"
+        )]
+    ])
+
+def get_bot_suffix_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="bot",
+            callback_data="suffix_bot"
+        )],
+        [InlineKeyboardButton(
+            text="_bot",
+            callback_data="suffix__bot"
+        )],
+        [InlineKeyboardButton(
+            text="◁ Назад",
+            callback_data="back_to_main"
+        )]
+    ])
+
+def get_search_type_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="5 букв",
+            callback_data="search_len_5"
+        )],
+        [InlineKeyboardButton(
+            text="6 букв",
+            callback_data="search_len_6"
+        )],
+        [InlineKeyboardButton(
+            text="С ключевым словом",
+            callback_data="search_keyword"
+        )],
+        [InlineKeyboardButton(
+            text="◁ Назад",
+            callback_data="back_to_main"
+        )]
+    ])
+
+def get_market_menu_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="Купить юзернейм",
+            callback_data="market_buy"
+        )],
+        [InlineKeyboardButton(
+            text="Продать юзернейм",
+            callback_data="market_sell"
+        )],
+        [InlineKeyboardButton(
+            text="◁ Назад",
+            callback_data="back_to_main"
+        )]
+    ])
+
+def get_profile_keyboard(is_pro: bool = False):
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text="Пополнить баланс",
+        callback_data="profile_deposit"
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Вывод средств",
+        callback_data="profile_withdraw"
+    ))
+    if not is_pro:
+        builder.row(InlineKeyboardButton(
+            text="Pro подписка",
+            callback_data="profile_pro"
+        ))
+    builder.row(InlineKeyboardButton(
+        text="Мои создания",
+        callback_data="profile_creations"
+    ))
+    builder.row(InlineKeyboardButton(
+        text="◁ Назад",
+        callback_data="back_to_main"
+    ))
+    return builder.as_markup()
+
+def get_nft_monitoring_keyboard(has_sub: bool = False):
+    builder = InlineKeyboardBuilder()
+    if not has_sub:
+        builder.row(InlineKeyboardButton(
+            text="Купить подписку (50 RUB/30 дней)",
+            callback_data="nft_buy_subscription"
+        ))
+    builder.row(InlineKeyboardButton(
+        text="Добавить коллекцию",
+        callback_data="nft_add_collection"
+    ))
+    builder.row(InlineKeyboardButton(
+        text="Мои коллекции",
+        callback_data="nft_my_collections"
+    ))
+    builder.row(InlineKeyboardButton(
+        text="◁ Назад",
+        callback_data="back_to_main"
+    ))
+    return builder.as_markup()
+
+def get_collections_keyboard(collections: List[Dict], page: int = 0):
+    builder = InlineKeyboardBuilder()
+    
+    start = page * 5
+    end = start + 5
+    page_collections = collections[start:end]
+    
+    for coll in page_collections:
+        builder.row(InlineKeyboardButton(
+            text=coll['name'],
+            callback_data=f"nft_select_{coll['address']}"
+        ))
+    
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton(
+            text="◁",
+            callback_data=f"nft_page_{page-1}"
+        ))
+    if end < len(collections):
+        nav_buttons.append(InlineKeyboardButton(
+            text="▷",
+            callback_data=f"nft_page_{page+1}"
+        ))
+    if nav_buttons:
+        builder.row(*nav_buttons)
+    
+    builder.row(InlineKeyboardButton(
+        text="◁ Назад",
+        callback_data="nft_menu"
+    ))
+    
+    return builder.as_markup()
+
+def get_transfer_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="Я передал владельца",
+            callback_data="check_owner"
+        )],
+        [InlineKeyboardButton(
+            text="◁ Отмена",
+            callback_data="cancel_sell"
+        )]
+    ])
+
+def get_admin_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="Добавить аккаунт",
+            callback_data="admin_add_account"
+        )],
+        [InlineKeyboardButton(
+            text="Список аккаунтов",
+            callback_data="admin_list_accounts"
+        )],
+        [InlineKeyboardButton(
+            text="Изменить баланс",
+            callback_data="admin_change_balance"
+        )],
+        [InlineKeyboardButton(
+            text="Удалить пользователя",
+            callback_data="admin_delete_user"
+        )],
+        [InlineKeyboardButton(
+            text="Статистика",
+            callback_data="admin_stats"
+        )],
+        [InlineKeyboardButton(
+            text="Рассылка",
+            callback_data="admin_broadcast"
+        )],
+        [InlineKeyboardButton(
+            text="◁ Назад",
+            callback_data="back_to_main"
+        )]
+    ])
+
+# --- Обработчики команд ---
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    await create_or_update_user(message.from_user.id, message.from_user.username)
+    await message.answer(
+        f"{em('bot_icon')} <b>Vest Search</b>\n"
+        f"{em('info')} Поиск юзернеймов, создание ботов, мониторинг NFT.",
+        reply_markup=get_main_keyboard()
+    )
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer(f"{em('cross')} Нет доступа!")
+        return
+    
+    await message.answer(
+        f"{em('admin')} <b>Админ-панель</b>\n\n"
+        f"Активных аккаунтов: {len(telethon_clients)}",
+        reply_markup=get_admin_keyboard()
+    )
+
+@router.message(F.text.in_([f"{em('search')} Поиск", "Поиск"]))
+async def menu_search(message: Message):
+    can_search, used, max_searches = await can_search_today(message.from_user.id)
+    
+    if not can_search:
+        await message.answer(
+            f"{em('cross')} <b>Достигнут дневной лимит поисков!</b>\n\n"
+            f"Использовано: {used}/{max_searches}\n"
+            f"Лимит обновится завтра.\n\n"
+            f"{em('pro')} Pro подписка увеличивает лимит до 100 поисков в день!",
+            reply_markup=get_main_keyboard()
+        )
+        return
+    
+    await message.answer(
+        f"{em('search')} <b>Выбери тип поиска:</b>\n\n"
+        f"Осталось поисков сегодня: {max_searches - used - 1}/{max_searches}",
+        reply_markup=get_search_type_keyboard()
+    )
+
+@router.message(F.text.in_([f"{em('bot_icon')} Поиск ботов", "Поиск ботов"]))
+async def menu_bot_search(message: Message):
+    if not telethon_clients:
+        await message.answer(f"{em('cross')} Нет активных аккаунтов!")
+        return
+    
+    can_search, used, max_searches = await can_search_today(message.from_user.id)
+    
+    if not can_search:
+        await message.answer(
+            f"{em('cross')} <b>Достигнут дневной лимит поисков!</b>\n\n"
+            f"Использовано: {used}/{max_searches}\n"
+            f"Лимит обновится завтра.",
+            reply_markup=get_main_keyboard()
+        )
+        return
+    
+    await message.answer(
+        f"{em('bot_icon')} <b>Поиск юзернеймов для ботов</b>\n\n"
+        f"{em('info')} Полная длина включает bot/_bot.\n"
+        f"Выбери тип поиска:\n\n"
+        f"Осталось поисков: {max_searches - used - 1}/{max_searches}",
+        reply_markup=get_bot_search_type_keyboard()
+    )
+
+@router.message(F.text.in_([f"{em('bot_create')} Создание бота", "Создание бота"]))
+async def menu_create_bot(message: Message, state: FSMContext):
+    if not telethon_clients:
+        await message.answer(f"{em('cross')} Нет активных аккаунтов!")
+        return
+    
+    limits = await get_user_limits(message.from_user.id)
+    user = await get_user(message.from_user.id)
+    current = user['bots_created'] or 0
+    
+    if current >= limits['bots']:
+        await message.answer(
+            f"{em('cross')} Достигнут лимит ботов ({limits['bots']})!\n\n"
+            f"{em('pro')} Pro подписка увеличивает лимит до 10 ботов.",
+            reply_markup=get_main_keyboard()
+        )
+        return
+    
+    await message.answer(
+        f"{em('bot_icon')} <b>Создание бота</b>\n\n"
+        f"Создано: {current}/{limits['bots']}\n\n"
+        f"Введи имя для бота (например: My Super Bot):",
+        reply_markup=get_back_button()
+    )
+    await state.set_state(CreateStates.waiting_for_bot_name)
+
+@router.message(CreateStates.waiting_for_bot_name)
+async def create_bot_name(message: Message, state: FSMContext):
+    bot_name = message.text.strip()
+    await state.update_data(bot_name=bot_name)
+    
+    await message.answer(
+        f"{em('bot_icon')} <b>Введи юзернейм для бота (без @):</b>\n"
+        f"{em('info')} Должен заканчиваться на bot или _bot\n"
+        f"Пример: mysuperbot или mysuper_bot",
+        reply_markup=get_back_button()
+    )
+    await state.set_state(CreateStates.waiting_for_bot_username)
+
+@router.message(CreateStates.waiting_for_bot_username)
+async def create_bot_username(message: Message, state: FSMContext):
+    bot_username = message.text.strip().lower().replace("@", "")
+    
+    if not (bot_username.endswith("bot") or bot_username.endswith("_bot")):
+        await message.answer(f"{em('cross')} Юзернейм должен заканчиваться на bot или _bot!")
+        return
+    
+    if not (5 <= len(bot_username) <= 32):
+        await message.answer(f"{em('cross')} Длина юзернейма должна быть от 5 до 32 символов!")
+        return
+    
+    data = await state.get_data()
+    bot_name = data.get('bot_name')
+    
+    limits = await get_user_limits(message.from_user.id)
+    user = await get_user(message.from_user.id)
+    current = user['bots_created'] or 0
+    
+    if current >= limits['bots']:
+        await message.answer(f"{em('cross')} Достигнут лимит ботов!")
+        await state.clear()
+        return
+    
+    await message.answer(f"{em('loading')} <b>Создаю бота через BotFather...</b>\nЭто займет около 20 секунд.")
+    
+    client = get_next_client()
+    if not client:
+        await message.answer(f"{em('cross')} Нет активных аккаунтов!")
+        await state.clear()
+        return
+    
+    result = await create_bot_via_botfather(client, bot_name, bot_username)
+    
+    if result:
+        username, token = result
+        await save_bot_token(message.from_user.id, username, token, bot_name)
+        await increment_created(message.from_user.id, "bot")
+        
+        await message.answer(
+            f"{em('check')} <b>Бот успешно создан!</b>\n\n"
+            f"🤖 Юзернейм: @{username}\n"
+            f"🔑 Токен: <code>{token}</code>\n\n"
+            f"{em('info')} Сохрани токен в безопасном месте!",
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        await message.answer(
+            f"{em('cross')} Не удалось создать бота.\n"
+            f"Возможно, юзернейм @{bot_username} уже занят.",
+            reply_markup=get_main_keyboard()
+        )
+    
+    await state.clear()
+
+@router.message(F.text.in_([f"{em('nft')} NFT Мониторинг", "NFT Мониторинг"]))
+async def menu_nft_monitoring(message: Message):
+    has_sub = await has_nft_monitoring(message.from_user.id)
+    
+    if has_sub:
+        sub_text = f"{em('check')} Подписка активна"
+    else:
+        sub_text = f"{em('cross')} Подписка не активна"
+    
+    my_monitorings = await get_user_nft_monitoring(message.from_user.id)
+    
+    text = (
+        f"{em('nft')} <b>NFT Мониторинг</b>\n\n"
+        f"{sub_text}\n"
+        f"Активных отслеживаний: {len(my_monitorings)}\n\n"
+        f"{em('info')} Бот отслеживает новые NFT в выбранных коллекциях "
+        f"и уведомляет о них в реальном времени."
+    )
+    
+    await message.answer(text, reply_markup=get_nft_monitoring_keyboard(has_sub))
+
+@router.message(F.text.in_([f"{em('market')} Маркет", "Маркет"]))
+async def menu_market_main(message: Message):
+    await message.answer(
+        f"{em('market')} <b>Маркетплейс</b>",
+        reply_markup=get_market_menu_keyboard()
+    )
+
+@router.message(F.text.in_([f"{em('profile')} Профиль", "Профиль"]))
+async def menu_profile(message: Message):
+    user = await get_user(message.from_user.id)
+    if not user:
+        await create_or_update_user(message.from_user.id, message.from_user.username)
+        user = await get_user(message.from_user.id)
+    
+    pro_status = "Pro" if user['is_pro'] else "Обычный"
+    if user['is_pro'] and user['pro_expires_at']:
+        days_left = (user['pro_expires_at'] - datetime.now()).days
+        pro_status += f" ({days_left} дн)"
+    
+    limits = await get_user_limits(message.from_user.id)
+    nft_sub = await has_nft_monitoring(message.from_user.id)
+    nft_status = "✅ Активна" if nft_sub else "❌ Не активна"
+    
+    text = (
+        f"{em('profile')} <b>Vest Search</b>\n\n"
+        f"{em('link')} @{user['username'] or 'не указан'}\n"
+        f"{em('wallet')} Баланс: {float(user['balance']):.2f} RUB\n"
+        f"{em('pro')} Статус: {pro_status}\n"
+        f"{em('nft')} NFT Мониторинг: {nft_status}\n\n"
+        f"{em('graph')} <b>Статистика:</b>\n"
+        f"• Поисков: {user['searches_count']}\n"
+        f"• Сегодня: {user['searches_today']}/{limits['searches_per_day']}\n"
+        f"• Найдено: {user['found_count']}\n\n"
+        f"{em('add')} <b>Лимиты:</b>\n"
+        f"• Ботов: {user['bots_created'] or 0}/{limits['bots']}"
+    )
+    
+    await message.answer(text, reply_markup=get_profile_keyboard(user['is_pro']))
+
+@router.callback_query(F.data == "back_to_main")
+async def back_to_main(callback: CallbackQuery):
+    await callback.message.delete()
+    await callback.message.answer(
+        f"{em('bot_icon')} <b>Vest Search</b>",
+        reply_markup=get_main_keyboard()
+    )
+    await callback.answer()
+
+# --- Профиль: пополнение ---
+@router.callback_query(F.data == "profile_deposit")
+async def profile_deposit(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        f"{em('money')} <b>Пополнение баланса</b>\n\n"
+        f"Введи сумму в рублях (от 20 RUB):",
+        reply_markup=get_back_button()
+    )
+    await state.set_state(BalanceStates.waiting_for_amount)
+    await callback.answer()
+
+@router.message(BalanceStates.waiting_for_amount)
+async def process_deposit_amount(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer(f"{em('cross')} Введи число.")
+        return
+    
+    amount = int(message.text)
+    if amount < 20:
+        await message.answer(f"{em('cross')} Минимальная сумма 20 RUB.")
+        return
+    
+    if not CRYPTO_BOT_TOKEN:
+        await message.answer(f"{em('cross')} Crypto Bot не настроен.")
+        await state.clear()
+        return
+    
+    invoice = await create_crypto_invoice(message.from_user.id, amount, "deposit")
+    
+    if not invoice:
+        await message.answer(f"{em('cross')} Ошибка создания счета.")
+        await state.clear()
+        return
+    
+    await state.update_data(invoice_id=invoice["invoice_id"], amount=amount)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="Оплатить",
+            url=invoice["pay_url"]
+        )],
+        [InlineKeyboardButton(
+            text="Проверить оплату",
+            callback_data="check_payment"
+        )],
+        [InlineKeyboardButton(
+            text="◁ Назад",
+            callback_data="back_to_main"
+        )]
+    ])
+    
+    await message.answer(
+        f"{em('money')} <b>Счет создан!</b>\n\n"
+        f"Сумма: {amount} RUB ({invoice['amount_usdt']} USDT)\n"
+        f"Нажми кнопку ниже для оплаты.",
+        reply_markup=keyboard
+    )
+    await state.set_state(BalanceStates.waiting_for_payment)
+
+@router.callback_query(F.data == "check_payment")
+async def check_payment(callback: CallbackQuery, state: FSMContext):
+    await callback.answer("Проверьте оплату в Crypto Bot", show_alert=True)
+    await state.clear()
+    await callback.message.edit_text(
+        f"{em('info')} Проверьте статус платежа в @CryptoBot",
+        reply_markup=get_back_button()
+    )
+
+@router.callback_query(F.data == "profile_pro")
+async def profile_pro(callback: CallbackQuery):
+    user = await get_user(callback.from_user.id)
+    if user and user['is_pro']:
+        await callback.answer("У вас уже есть Pro подписка!", show_alert=True)
+        return
+    
+    balance = await get_user_balance(callback.from_user.id)
+    
+    if balance >= 30:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="Оплатить с баланса",
+                callback_data="pay_pro_balance"
+            )],
+            [InlineKeyboardButton(
+                text="◁ Назад",
+                callback_data="back_to_main"
+            )]
+        ])
+        
+        await callback.message.edit_text(
+            f"{em('pro')} <b>Pro подписка</b>\n\n"
+            f"• Ботов: до 10\n"
+            f"• Поисков в день: 100\n\n"
+            f"Стоимость: 30 RUB / 30 дней\n"
+            f"Ваш баланс: {balance:.2f} RUB\n\n"
+            f"Оплатить с баланса?",
+            reply_markup=keyboard
+        )
+    else:
+        await callback.message.edit_text(
+            f"{em('cross')} Недостаточно средств!\n"
+            f"Баланс: {balance:.2f} RUB\n"
+            f"Необходимо: 30 RUB\n\n"
+            f"Пополните баланс в профиле.",
+            reply_markup=get_back_button()
+        )
+    
+    await callback.answer()
+
+@router.callback_query(F.data == "pay_pro_balance")
+async def pay_pro_balance(callback: CallbackQuery):
+    if await subtract_balance(callback.from_user.id, 30):
+        await activate_pro(callback.from_user.id)
+        await callback.message.edit_text(
+            f"{em('check')} <b>Pro подписка активирована на 30 дней!</b>",
+            reply_markup=get_back_button()
+        )
+    else:
+        await callback.answer("Ошибка оплаты", show_alert=True)
+    
+    await callback.answer()
+
+@router.callback_query(F.data == "profile_creations")
+async def profile_creations(callback: CallbackQuery):
+    async with db_pool.acquire() as conn:
+        bots = await conn.fetch(
+            "SELECT bot_username, bot_name FROM created_bots WHERE user_id = $1 ORDER BY created_date DESC LIMIT 10",
+            callback.from_user.id
+        )
+    
+    text = f"{em('eye')} <b>Мои создания</b>\n\n"
+    
+    if bots:
+        text += f"{em('bot_icon')} <b>Боты:</b>\n"
+        for b in bots:
+            text += f"• @{b['bot_username']} - {b['bot_name']}\n"
+    else:
+        text += "У вас пока нет созданных ботов."
+    
+    await callback.message.edit_text(text, reply_markup=get_back_button())
+    await callback.answer()
+
+@router.callback_query(F.data == "profile_withdraw")
+async def profile_withdraw(callback: CallbackQuery):
+    await callback.message.edit_text(
+        f"{em('support')} <b>Вывод средств</b>\n\n"
+        f"Для вывода обратитесь в поддержку:\n"
+        f"@{SUPPORT_USERNAME}",
+        reply_markup=get_back_button()
+    )
+    await callback.answer()
+
+# --- Поиск обычных юзернеймов ---
+@router.callback_query(F.data.startswith("search_len_"))
+async def search_len_handler(callback: CallbackQuery):
+    can_search, used, max_searches = await can_search_today(callback.from_user.id)
+    if not can_search:
+        await callback.answer(f"Достигнут дневной лимит ({used}/{max_searches})!", show_alert=True)
+        return
+    
+    length = int(callback.data.split("_")[-1])
+    
+    if not telethon_clients:
+        await callback.answer("Нет активных аккаунтов!", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        f"{em('loading')} <b>Ищу свободные юзернеймы из {length} букв...</b>",
+        reply_markup=get_back_button()
+    )
+    
+    await increment_search(callback.from_user.id)
+    
+    variants = generate_random_usernames(length, 50)
+    found = await check_many_usernames(variants)
+    
+    if found:
+        await add_found_nick(callback.from_user.id, len(found[:3]))
+        text = f"{em('check')} <b>Найдены свободные юзернеймы ({length} букв):</b>\n\n"
+        for u in found[:3]:
+            text += f"• @{u}\n"
+    else:
+        text = f"{em('cross')} <b>Ничего не найдено</b>"
+    
+    await callback.message.edit_text(text, reply_markup=get_back_button())
+    await callback.answer()
+
+@router.callback_query(F.data == "search_keyword")
+async def search_keyword_start(callback: CallbackQuery, state: FSMContext):
+    can_search, used, max_searches = await can_search_today(callback.from_user.id)
+    if not can_search:
+        await callback.answer(f"Достигнут дневной лимит ({used}/{max_searches})!", show_alert=True)
+        return
+    
+    if not telethon_clients:
+        await callback.answer("Нет активных аккаунтов!", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        f"{em('pencil')} <b>Введи ключевое слово (латиница):</b>",
+        reply_markup=get_back_button()
+    )
+    await state.set_state(SearchStates.waiting_for_keyword)
+    await callback.answer()
+
+@router.message(SearchStates.waiting_for_keyword)
+async def process_keyword(message: Message, state: FSMContext):
+    keyword = message.text.strip().lower()
+    
+    if not all(c.isalpha() for c in keyword):
+        await message.answer(f"{em('cross')} Используй только латинские буквы")
+        await state.clear()
+        return
+    
+    await state.update_data(keyword=keyword)
+    await message.answer(
+        f"{em('pencil')} <b>Укажи длину (от 5 до 32):</b>",
+        reply_markup=get_back_button()
+    )
+    await state.set_state(SearchStates.waiting_for_length)
+
+@router.message(SearchStates.waiting_for_length)
+async def process_length_and_search(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer(f"{em('cross')} Введи число.")
+        return
+    
+    length = int(message.text)
+    if not (5 <= length <= 32):
+        await message.answer(f"{em('cross')} Длина должна быть от 5 до 32.")
+        return
+    
+    data = await state.get_data()
+    keyword = data['keyword']
+    
+    await message.answer(f"{em('loading')} <b>Ищу с '{keyword}'...</b>")
+    
+    await increment_search(message.from_user.id)
+    
+    variants = generate_with_keyword(keyword, length, 50)
+    found = await check_many_usernames(variants)
+    
+    if found:
+        await add_found_nick(message.from_user.id, len(found[:3]))
+        text = f"{em('check')} <b>Найдено с '{keyword}':</b>\n\n"
+        for u in found[:3]:
+            text += f"• @{u}\n"
+    else:
+        text = f"{em('cross')} <b>Ничего не найдено.</b>"
+    
+    await message.answer(text, reply_markup=get_main_keyboard())
+    await state.clear()
+
+# --- Поиск ботов ---
+@router.callback_query(F.data.startswith("botsearch_"))
+async def botsearch_handler(callback: CallbackQuery, state: FSMContext):
+    can_search, used, max_searches = await can_search_today(callback.from_user.id)
+    if not can_search:
+        await callback.answer(f"Достигнут дневной лимит ({used}/{max_searches})!", show_alert=True)
+        return
+    
+    data = callback.data.replace("botsearch_", "")
+    
+    if data == "len_5":
+        await state.update_data(bot_length=5, bot_keyword=None)
+        await callback.message.edit_text(
+            f"{em('bot_icon')} <b>Выбери суффикс:</b>",
+            reply_markup=get_bot_suffix_keyboard()
+        )
+        await state.set_state(BotSearchStates.waiting_for_suffix)
+    elif data == "len_6":
+        await state.update_data(bot_length=6, bot_keyword=None)
+        await callback.message.edit_text(
+            f"{em('bot_icon')} <b>Выбери суффикс:</b>",
+            reply_markup=get_bot_suffix_keyboard()
+        )
+        await state.set_state(BotSearchStates.waiting_for_suffix)
+    elif data == "keyword":
+        await callback.message.edit_text(
+            f"{em('pencil')} <b>Введи ключевое слово:</b>",
+            reply_markup=get_back_button()
+        )
+        await state.set_state(BotSearchStates.waiting_for_keyword)
+    
+    await callback.answer()
+
+@router.message(BotSearchStates.waiting_for_keyword)
+async def botsearch_keyword(message: Message, state: FSMContext):
+    keyword = message.text.strip().lower()
+    
+    if not all(c.isalnum() or c == '_' for c in keyword):
+        await message.answer(f"{em('cross')} Используй только латинские буквы, цифры и _")
+        return
+    
+    await state.update_data(bot_keyword=keyword)
+    await message.answer(
+        f"{em('pencil')} <b>Укажи ПОЛНУЮ длину (включая bot/_bot, от 5 до 32):</b>",
+        reply_markup=get_back_button()
+    )
+    await state.set_state(BotSearchStates.waiting_for_length)
+
+@router.message(BotSearchStates.waiting_for_length)
+async def botsearch_length(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer(f"{em('cross')} Введи число.")
+        return
+    
+    length = int(message.text)
+    if not (5 <= length <= 32):
+        await message.answer(f"{em('cross')} Длина должна быть от 5 до 32.")
+        return
+    
+    await state.update_data(bot_length=length)
+    await message.answer(
+        f"{em('bot_icon')} <b>Выбери суффикс:</b>",
+        reply_markup=get_bot_suffix_keyboard()
+    )
+    await state.set_state(BotSearchStates.waiting_for_suffix)
+
+@router.callback_query(BotSearchStates.waiting_for_suffix, F.data.startswith("suffix_"))
+async def botsearch_suffix(callback: CallbackQuery, state: FSMContext):
+    suffix_type = callback.data.replace("suffix_", "")
+    
+    data = await state.get_data()
+    length = data.get('bot_length', 5)
+    keyword = data.get('bot_keyword')
+    
+    await callback.message.edit_text(
+        f"{em('loading')} <b>Ищу юзернеймы для ботов (полная длина {length})...</b>",
+        reply_markup=get_back_button()
+    )
+    
+    await increment_search(callback.from_user.id)
+    
+    variants = generate_bot_usernames(keyword or "", length, suffix_type, 50)
+    found = await check_many_usernames(variants)
+    
+    if found:
+        await add_found_nick(callback.from_user.id, len(found[:3]))
+        text = f"{em('check')} <b>Найдены свободные юзернеймы:</b>\n\n"
+        for u in found[:3]:
+            text += f"• @{u}\n"
+    else:
+        text = f"{em('cross')} <b>Ничего не найдено.</b>"
+    
+    await callback.message.edit_text(text, reply_markup=get_back_button())
+    await state.clear()
+    await callback.answer()
+
+# --- Маркет ---
+@router.callback_query(F.data == "market_buy")
+async def market_buy_list(callback: CallbackQuery):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, channel_username, price, seller_username 
+               FROM market_listings 
+               WHERE status = 'active' 
+               ORDER BY price ASC"""
+        )
+    
+    if not rows:
+        await callback.message.edit_text(
+            f"{em('market')} <b>Нет доступных юзернеймов</b>",
+            reply_markup=get_back_button()
+        )
+        await callback.answer()
+        return
+    
+    text = f"{em('market')} <b>Доступные юзернеймы:</b>\n\n"
+    keyboard = []
+    
+    for row in rows:
+        text += f"@{row['channel_username']} — {float(row['price'])} RUB\n"
+        keyboard.append([InlineKeyboardButton(
+            text=f"@{row['channel_username']} | {float(row['price'])} RUB",
+            callback_data=f"buy_channel_{row['id']}"
+        )])
+    
+    keyboard.append([InlineKeyboardButton(
+        text="◁ Назад",
+        callback_data="back_to_market_menu"
+    )])
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("buy_channel_"))
+async def buy_channel_confirm(callback: CallbackQuery):
+    listing_id = int(callback.data.split("_")[-1])
+    
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT channel_username, price, seller_id, seller_username FROM market_listings WHERE id = $1 AND status = 'active'",
+            listing_id
+        )
+    
+    if not row:
+        await callback.answer("Лот не найден", show_alert=True)
+        return
+    
+    price = float(row['price'])
+    user_balance = await get_user_balance(callback.from_user.id)
+    
+    if user_balance < price:
+        await callback.answer(f"Недостаточно средств! Баланс: {user_balance:.2f} RUB", show_alert=True)
+        return
+    
+    if not await subtract_balance(callback.from_user.id, price):
+        await callback.answer("Ошибка списания", show_alert=True)
+        return
+    
+    seller_amount = price * 0.9
+    await add_balance(row['seller_id'], seller_amount)
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE market_listings SET status = 'sold', buyer_id = $1, sold_date = NOW() WHERE id = $2",
+            callback.from_user.id, listing_id
+        )
+    
+    await callback.message.edit_text(
+        f"{em('check')} <b>Покупка успешна!</b>\n\n"
+        f"Юзернейм: @{row['channel_username']}\n"
+        f"Цена: {price} RUB\n\n"
+        f"Продавец: @{row['seller_username']}",
+        reply_markup=get_back_button()
+    )
+    
+    try:
+        await bot.send_message(
+            row['seller_id'],
+            f"{em('money')} <b>Юзернейм @{row['channel_username']} продан!</b>\n"
+            f"На баланс зачислено: {seller_amount:.2f} RUB"
+        )
+    except:
+        pass
+    
+    await callback.answer()
+
+@router.callback_query(F.data == "back_to_market_menu")
+async def back_to_market_menu(callback: CallbackQuery):
+    await callback.message.edit_text(
+        f"{em('market')} <b>Маркетплейс</b>",
+        reply_markup=get_market_menu_keyboard()
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "market_sell")
+async def market_sell_start(callback: CallbackQuery, state: FSMContext):
+    if not telethon_clients:
+        await callback.answer("Нет активных аккаунтов!", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        f"{em('money')} <b>Продажа юзернейма</b>\n\n"
+        f"Введи цену (от 5 до 20000 RUB):\n"
+        f"{em('info')} Комиссия платформы: 10%",
+        reply_markup=get_back_button()
+    )
+    await state.set_state(MarketSellStates.waiting_for_price)
+    await callback.answer()
+
+@router.message(MarketSellStates.waiting_for_price)
+async def market_sell_price(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer(f"{em('cross')} Введи число.")
+        return
+    
+    price = int(message.text)
+    if not (5 <= price <= 20000):
+        await message.answer(f"{em('cross')} Цена должна быть от 5 до 20000 RUB.")
+        return
+    
+    await state.update_data(price=price)
+    await message.answer(
+        f"{em('invite')} <b>Отправь ссылку-приглашение в канал:</b>",
+        reply_markup=get_back_button()
+    )
+    await state.set_state(MarketSellStates.waiting_for_invite_link)
+
+@router.message(MarketSellStates.waiting_for_invite_link)
+async def market_sell_invite_link(message: Message, state: FSMContext):
+    invite_link = message.text.strip()
+    
+    data = await state.get_data()
+    price = data['price']
+    
+    client = get_next_client()
+    if not client:
+        await message.answer(f"{em('cross')} Нет активных аккаунтов!")
+        await state.clear()
+        return
+    
+    bot_username = await get_bot_username(client)
+    
+    await message.answer(f"{em('loading')} Вступаю в канал...")
+    
+    success, channel_username, error = await join_channel_by_link(client, invite_link)
+    
+    if not success or not channel_username:
+        await message.answer(f"{em('cross')} Не удалось вступить в канал!")
+        await state.clear()
+        return
+    
+    await state.update_data(
+        channel_username=channel_username,
+        bot_username=bot_username,
+        price=price
+    )
+    
+    await message.answer(
+        f"{em('check')} Бот @{bot_username} в канале @{channel_username}!\n\n"
+        f"{em('owner')} Передай боту права администратора и нажми кнопку:",
+        reply_markup=get_transfer_keyboard()
+    )
+    await state.set_state(MarketSellStates.waiting_for_transfer)
+
+@router.callback_query(F.data == "check_owner")
+async def check_owner(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    channel_username = data.get("channel_username")
+    price = data.get("price")
+    bot_username = data.get("bot_username")
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO market_listings 
+               (seller_id, seller_username, channel_username, price, status, bot_account_username) 
+               VALUES ($1, $2, $3, $4, 'active', $5)""",
+            callback.from_user.id, callback.from_user.username, channel_username, price, bot_username
+        )
+    
+    await callback.message.edit_text(
+        f"{em('check')} <b>Объявление создано!</b>\n\n"
+        f"@{channel_username} — {price} RUB",
+        reply_markup=get_back_button()
+    )
+    await state.clear()
+    await callback.answer("Объявление создано!", show_alert=True)
+
+@router.callback_query(F.data == "cancel_sell")
+async def cancel_sell(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        f"{em('cross')} <b>Продажа отменена</b>",
+        reply_markup=get_back_button()
+    )
+    await state.clear()
+    await callback.answer()
+
+# --- NFT Мониторинг ---
+@router.callback_query(F.data == "nft_buy_subscription")
+async def nft_buy_subscription(callback: CallbackQuery):
+    balance = await get_user_balance(callback.from_user.id)
+    price = 50
+    
+    if balance >= price:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="Оплатить с баланса",
+                callback_data="nft_pay_balance"
+            )],
+            [InlineKeyboardButton(
+                text="◁ Назад",
+                callback_data="nft_menu"
+            )]
+        ])
+        
+        await callback.message.edit_text(
+            f"{em('nft')} <b>Подписка на NFT мониторинг</b>\n\n"
+            f"• Отслеживание неограниченного числа коллекций\n"
+            f"• Уведомления о новых NFT в реальном времени\n"
+            f"• Информация о владельце и цене\n\n"
+            f"Стоимость: {price} RUB / 30 дней\n"
+            f"Ваш баланс: {balance:.2f} RUB\n\n"
+            f"Оплатить с баланса?",
+            reply_markup=keyboard
+        )
+    else:
+        if CRYPTO_BOT_TOKEN:
+            invoice = await create_crypto_invoice(callback.from_user.id, price, "nft_monitoring")
+            
+            if invoice:
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="Оплатить",
+                        url=invoice["pay_url"]
+                    )],
+                    [InlineKeyboardButton(
+                        text="◁ Назад",
+                        callback_data="nft_menu"
+                    )]
+                ])
+                
+                await callback.message.edit_text(
+                    f"{em('nft')} <b>Подписка на NFT мониторинг</b>\n\n"
+                    f"Стоимость: {price} RUB ({invoice['amount_usdt']} USDT)\n\n"
+                    f"Нажмите кнопку для оплаты.",
+                    reply_markup=keyboard
+                )
+            else:
+                await callback.answer("Ошибка создания счета", show_alert=True)
+        else:
+            await callback.message.edit_text(
+                f"{em('cross')} Недостаточно средств!\n"
+                f"Баланс: {balance:.2f} RUB\n"
+                f"Необходимо: {price} RUB\n\n"
+                f"Пополните баланс в профиле.",
+                reply_markup=get_back_button()
+            )
+    
+    await callback.answer()
+
+@router.callback_query(F.data == "nft_pay_balance")
+async def nft_pay_balance(callback: CallbackQuery):
+    if await subtract_balance(callback.from_user.id, 50):
+        await activate_nft_monitoring(callback.from_user.id, 30)
+        await callback.message.edit_text(
+            f"{em('check')} <b>Подписка на NFT мониторинг активирована на 30 дней!</b>",
+            reply_markup=get_nft_monitoring_keyboard(True)
+        )
+    else:
+        await callback.answer("Ошибка оплаты", show_alert=True)
+    
+    await callback.answer()
+
+@router.callback_query(F.data == "nft_menu")
+async def nft_menu_back(callback: CallbackQuery):
+    has_sub = await has_nft_monitoring(callback.from_user.id)
+    my_monitorings = await get_user_nft_monitoring(callback.from_user.id)
+    
+    if has_sub:
+        sub_text = f"{em('check')} Подписка активна"
+    else:
+        sub_text = f"{em('cross')} Подписка не активна"
+    
+    text = (
+        f"{em('nft')} <b>NFT Мониторинг</b>\n\n"
+        f"{sub_text}\n"
+        f"Активных отслеживаний: {len(my_monitorings)}\n\n"
+        f"{em('info')} Бот отслеживает новые NFT в выбранных коллекциях "
+        f"и уведомляет о них в реальном времени."
+    )
+    
+    await callback.message.edit_text(text, reply_markup=get_nft_monitoring_keyboard(has_sub))
+    await callback.answer()
+
+@router.callback_query(F.data == "nft_add_collection")
+async def nft_add_collection(callback: CallbackQuery, state: FSMContext):
+    if not await has_nft_monitoring(callback.from_user.id):
+        await callback.answer("Сначала купите подписку!", show_alert=True)
+        return
+    
+    collections = await fetch_nft_collections()
+    await state.update_data(nft_collections=collections, nft_page=0)
+    
+    text = f"{em('nft')} <b>Выберите коллекцию для отслеживания:</b>"
+    await callback.message.edit_text(text, reply_markup=get_collections_keyboard(collections, 0))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("nft_page_"))
+async def nft_change_page(callback: CallbackQuery, state: FSMContext):
+    page = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+    collections = data.get('nft_collections', [])
+    
+    await callback.message.edit_text(
+        f"{em('nft')} <b>Выберите коллекцию для отслеживания:</b>",
+        reply_markup=get_collections_keyboard(collections, page)
+    )
+    await state.update_data(nft_page=page)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("nft_select_"))
+async def nft_select_collection(callback: CallbackQuery, state: FSMContext):
+    collection_address = callback.data.replace("nft_select_", "")
+    data = await state.get_data()
+    collections = data.get('nft_collections', [])
+    
+    collection_name = "Unknown"
+    for coll in collections:
+        if coll['address'] == collection_address:
+            collection_name = coll['name']
+            break
+    
+    await add_nft_monitoring(callback.from_user.id, collection_address, collection_name)
+    
+    await callback.message.edit_text(
+        f"{em('check')} <b>Коллекция добавлена!</b>\n\n"
+        f"📦 {collection_name}\n"
+        f"Теперь вы будете получать уведомления о новых NFT в этой коллекции.",
+        reply_markup=get_nft_monitoring_keyboard(True)
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "nft_my_collections")
+async def nft_my_collections(callback: CallbackQuery):
+    my_monitorings = await get_user_nft_monitoring(callback.from_user.id)
+    
+    if not my_monitorings:
+        text = f"{em('info')} У вас нет отслеживаемых коллекций."
+        await callback.message.edit_text(text, reply_markup=get_nft_monitoring_keyboard(True))
+        await callback.answer()
+        return
+    
+    text = f"{em('eye')} <b>Мои отслеживаемые коллекции:</b>\n\n"
+    keyboard = []
+    
+    for mon in my_monitorings:
+        text += f"📦 {mon['collection_name']}\n"
+        keyboard.append([InlineKeyboardButton(
+            text=f"❌ Удалить {mon['collection_name']}",
+            callback_data=f"nft_remove_{mon['id']}"
+        )])
+    
+    keyboard.append([InlineKeyboardButton(
+        text="◁ Назад",
+        callback_data="nft_menu"
+    )])
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("nft_remove_"))
+async def nft_remove_collection(callback: CallbackQuery):
+    monitoring_id = int(callback.data.split("_")[-1])
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE nft_monitoring SET is_active = FALSE WHERE id = $1",
+            monitoring_id
+        )
+    
+    await callback.answer("Коллекция удалена из отслеживания!", show_alert=True)
+    await nft_my_collections(callback)
+
+# --- Админ-панель ---
+@router.callback_query(F.data == "admin_add_account")
+async def admin_add_account(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа!", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        f"{em('phone')} <b>Введи номер телефона:</b>\n+79123456789",
+        reply_markup=get_back_button()
+    )
+    await state.set_state(AdminStates.waiting_for_phone)
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_phone)
+async def admin_process_phone(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    phone = message.text.strip()
+    
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    await client.connect()
+    
+    try:
+        sent = await client.send_code_request(phone)
+        await state.update_data(
+            phone=phone,
+            phone_code_hash=sent.phone_code_hash,
+            client_session=client.session.save()
+        )
+        
+        await message.answer(
+            f"{em('pencil')} <b>Введи код из Telegram:</b>",
+            reply_markup=get_back_button()
+        )
+        await state.set_state(AdminStates.waiting_for_code)
+    except Exception as e:
+        await message.answer(f"{em('cross')} Ошибка: {e}")
+        await state.clear()
+
+@router.message(AdminStates.waiting_for_code)
+async def admin_process_code(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    code = message.text.strip()
+    data = await state.get_data()
+    
+    client = TelegramClient(StringSession(data['client_session']), API_ID, API_HASH)
+    await client.connect()
+    
+    try:
+        await client.sign_in(
+            phone=data['phone'],
+            code=code,
+            phone_code_hash=data['phone_code_hash']
+        )
+        
+        session_string = client.session.save()
+        await save_telethon_account(data['phone'], session_string, ADMIN_ID)
+        
+        new_client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        await new_client.connect()
+        telethon_clients.append(new_client)
+        
+        await message.answer(
+            f"{em('check')} <b>Аккаунт добавлен!</b>",
+            reply_markup=get_main_keyboard()
+        )
+        await state.clear()
+        
+    except SessionPasswordNeededError:
+        await state.update_data(client_session=client.session.save())
+        await message.answer(
+            f"{em('key')} <b>Введи пароль 2FA:</b>",
+            reply_markup=get_back_button()
+        )
+        await state.set_state(AdminStates.waiting_for_2fa)
+        
+    except Exception as e:
+        await message.answer(f"{em('cross')} Ошибка: {e}")
+        await state.clear()
+
+@router.message(AdminStates.waiting_for_2fa)
+async def admin_process_2fa(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    password = message.text.strip()
+    data = await state.get_data()
+    
+    client = TelegramClient(StringSession(data['client_session']), API_ID, API_HASH)
+    await client.connect()
+    
+    try:
+        await client.sign_in(password=password)
+        
+        session_string = client.session.save()
+        await save_telethon_account(data['phone'], session_string, ADMIN_ID)
+        
+        new_client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        await new_client.connect()
+        telethon_clients.append(new_client)
+        
+        await message.answer(
+            f"{em('check')} <b>Аккаунт добавлен!</b>",
+            reply_markup=get_main_keyboard()
+        )
+    except:
+        await message.answer(f"{em('cross')} Неверный пароль")
+    
+    await state.clear()
+
+@router.callback_query(F.data == "admin_list_accounts")
+async def admin_list_accounts(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа!", show_alert=True)
+        return
+    
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT phone, is_active FROM telethon_accounts")
+    
+    if not rows:
+        text = f"{em('info')} Нет добавленных аккаунтов"
+    else:
+        text = f"{em('admin')} <b>Список аккаунтов:</b>\n\n"
+        for row in rows:
+            status = "✅" if row['is_active'] else "❌"
+            text += f"{status} {row['phone']}\n"
+    
+    await callback.message.edit_text(text, reply_markup=get_admin_keyboard())
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_change_balance")
+async def admin_change_balance_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа!", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        f"{em('money')} <b>Введи ID пользователя:</b>",
+        reply_markup=get_back_button()
+    )
+    await state.set_state(AdminStates.waiting_for_balance_user)
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_balance_user)
+async def admin_balance_user(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer(f"{em('cross')} Введи числовой ID.")
+        return
+    
+    user_id = int(message.text)
+    user = await get_user(user_id)
+    
+    if not user:
+        await message.answer(f"{em('cross')} Пользователь не найден.")
+        return
+    
+    await state.update_data(balance_user_id=user_id)
+    await message.answer(
+        f"Пользователь: @{user['username'] or user_id}\n"
+        f"Баланс: {float(user['balance']):.2f} RUB\n\n"
+        f"Введи новый баланс:"
+    )
+    await state.set_state(AdminStates.waiting_for_balance_amount)
+
+@router.message(AdminStates.waiting_for_balance_amount)
+async def admin_balance_amount(message: Message, state: FSMContext):
+    try:
+        amount = float(message.text)
+    except:
+        await message.answer(f"{em('cross')} Введи число.")
+        return
+    
+    data = await state.get_data()
+    user_id = data['balance_user_id']
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE users SET balance = $1 WHERE user_id = $2", amount, user_id)
+    
+    await message.answer(
+        f"{em('check')} <b>Баланс обновлен!</b>",
+        reply_markup=get_main_keyboard()
+    )
+    await state.clear()
+
+@router.callback_query(F.data == "admin_delete_user")
+async def admin_delete_user_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа!", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        f"{em('trash')} <b>Введи ID пользователя для удаления:</b>",
+        reply_markup=get_back_button()
+    )
+    await state.set_state(AdminStates.waiting_for_delete_user)
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_delete_user)
+async def admin_delete_user_process(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer(f"{em('cross')} Введи числовой ID.")
+        return
+    
+    user_id = int(message.text)
+    await delete_user(user_id)
+    
+    await message.answer(
+        f"{em('check')} <b>Пользователь {user_id} удален!</b>",
+        reply_markup=get_main_keyboard()
+    )
+    await state.clear()
+
+@router.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа!", show_alert=True)
+        return
+    
+    stats = await get_stats()
+    
+    text = (
+        f"{em('stats')} <b>Статистика</b>\n\n"
+        f"👥 Пользователей: {stats['total_users']}\n"
+        f"🌟 Pro: {stats['pro_users']}\n"
+        f"💰 Баланс: {stats['total_balance']:.2f} RUB\n"
+        f"🔍 Поисков: {stats['total_searches']}\n"
+        f"📦 Лотов: {stats['active_listings']}\n"
+        f"🤖 Ботов создано: {stats['total_bots']}\n"
+        f"📱 Аккаунтов: {stats['telethon_accounts']}\n"
+        f"🎨 NFT подписок: {stats['nft_subs']}"
+    )
+    
+    await callback.message.edit_text(text, reply_markup=get_admin_keyboard())
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа!", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        f"{em('broadcast')} <b>Отправь сообщение для рассылки:</b>",
+        reply_markup=get_back_button()
+    )
+    await state.set_state(AdminStates.waiting_for_broadcast)
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_broadcast)
+async def admin_broadcast_process(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    users = await get_all_users()
+    success = 0
+    
+    for user_id in users:
+        try:
+            await message.copy_to(user_id)
+            success += 1
+        except:
+            pass
+        await asyncio.sleep(0.05)
+    
+    await message.answer(
+        f"{em('check')} <b>Рассылка завершена!</b>\n✅ {success}/{len(users)}",
+        reply_markup=get_main_keyboard()
+    )
+    await state.clear()
+
+# --- Жизненный цикл ---
+@dp.startup()
+async def on_startup():
+    global http_session
+    http_session = aiohttp.ClientSession()
+    await init_db()
+    await load_telethon_accounts()
+    
+    # Запускаем фоновую задачу мониторинга NFT
+    asyncio.create_task(nft_monitoring_task())
+    
+    logger.info(f"Vest Search запущен, аккаунтов: {len(telethon_clients)}")
+
+@dp.shutdown()
+async def on_shutdown():
+    if http_session:
+        await http_session.close()
+    if db_pool:
+        await db_pool.close()
+    for client in telethon_clients:
+        await client.disconnect()
+    logger.info("Бот остановлен")
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
